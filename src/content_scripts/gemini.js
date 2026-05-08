@@ -13,7 +13,9 @@
     FILENAME_INPUT_ID: 'gemini-filename-input',
     SELECT_DROPDOWN_ID: 'gemini-select-dropdown',
     CHECKBOX_CLASS: 'gemini-export-checkbox',
+    SIDEBAR_CHECKBOX_CLASS: 'gemini-sidebar-export-checkbox',
     EXPORT_MODE_NAME: 'gemini-export-mode',
+    SIDEBAR_CONTROLS_ID: 'gemini-sidebar-export-controls',
     
     SELECTORS: {
       CHAT_CONTAINER: '[data-test-id="chat-history-container"]',
@@ -22,7 +24,10 @@
       USER_QUERY_TEXT: '.query-text .query-text-line',
       MODEL_RESPONSE: 'model-response',
       MODEL_RESPONSE_CONTENT: 'message-content .markdown',
-      CONVERSATION_TITLE: '[data-test-id="conversation-title"]'
+      CONVERSATION_TITLE: '[data-test-id="conversation-title"]',
+      SIDEBAR_CONTAINER: 'nav[role="navigation"]',
+      SIDEBAR_ITEM: 'a[href*="/app/"]',
+      SIDEBAR_ITEM_TEXT: '.history-item-title, span'
     },
     
     TIMING: {
@@ -198,18 +203,28 @@
   // ============================================================================
   
   class FileExportService {
-    static downloadMarkdown(markdown, filenameBase) {
-      const blob = new Blob([markdown], { type: 'text/markdown' });
+    static download(content, filenameBase, extension) {
+      const mimeTypes = {
+        'md': 'text/markdown',
+        'html': 'text/html',
+        'txt': 'text/plain'
+      };
+
+      const blob = new Blob([content], { type: mimeTypes[extension] || 'text/plain' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${filenameBase}.md`;
+      a.download = `${filenameBase}.${extension}`;
       document.body.appendChild(a);
       a.click();
       setTimeout(() => {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
       }, CONFIG.TIMING.NOTIFICATION_CLEANUP_DELAY);
+    }
+
+    static downloadMarkdown(markdown, filenameBase) {
+      this.download(markdown, filenameBase, 'md');
     }
 
     static async exportToClipboard(markdown) {
@@ -219,8 +234,63 @@
   }
 
   // ============================================================================
-  // MARKDOWN CONVERTER SERVICE
+  // FORMAT CONVERTER SERVICES
   // ============================================================================
+
+  /**
+   * Converts Markdown to simple HTML
+   */
+  class HtmlConverter {
+    static convert(markdown, title) {
+      // Basic markdown to HTML conversion (very simple)
+      let html = markdown
+        .replace(/^# (.*$)/gim, '<h1>$1</h1>')
+        .replace(/^## (.*$)/gim, '<h2>$1</h2>')
+        .replace(/^### (.*$)/gim, '<h3>$1</h3>')
+        .replace(/^\> (.*$)/gim, '<blockquote>$1</blockquote>')
+        .replace(/\*\*(.*)\*\*/gim, '<strong>$1</strong>')
+        .replace(/\*(.*)\*/gim, '<em>$1</em>')
+        .replace(/---/gim, '<hr>')
+        .replace(/\n/gim, '<br>\n');
+
+      return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${title || 'Gemini Export'}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; }
+        h1 { border-bottom: 2px solid #eee; padding-bottom: 10px; }
+        h2 { margin-top: 30px; border-bottom: 1px solid #eee; }
+        blockquote { border-left: 4px solid #eee; padding-left: 15px; color: #666; margin: 20px 0; }
+        code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; font-family: monospace; }
+        pre { background: #f4f4f4; padding: 15px; overflow-x: auto; border-radius: 5px; }
+        hr { border: 0; border-top: 1px solid #eee; margin: 30px 0; }
+    </style>
+</head>
+<body>
+    ${html}
+</body>
+</html>`;
+    }
+  }
+
+  /**
+   * Converts Markdown to plain text
+   */
+  class TxtConverter {
+    static convert(markdown) {
+      return markdown
+        .replace(/^#+ /gim, '')
+        .replace(/^\> /gim, '')
+        .replace(/\*\*/gim, '')
+        .replace(/\*/gim, '')
+        .replace(/---/gim, '-----------------------')
+        .replace(/\[(.*?)\]\(.*?\)/gim, '$1');
+    }
+  }
   
   class MarkdownConverter {
     constructor() {
@@ -438,6 +508,136 @@
   }
 
   // ============================================================================
+  // SIDEBAR MANAGER
+  // ============================================================================
+
+  /**
+   * Manages the Gemini sidebar, including checkbox injection and bulk export UI
+   */
+  class SidebarManager {
+    constructor() {
+      this.observer = null;
+    }
+
+    /**
+     * Injects checkboxes into the sidebar chat entries
+     */
+    injectCheckboxes() {
+      const items = document.querySelectorAll(CONFIG.SELECTORS.SIDEBAR_ITEM);
+      items.forEach(item => {
+        if (item.querySelector(`.${CONFIG.SIDEBAR_CHECKBOX_CLASS}`)) return;
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = CONFIG.SIDEBAR_CHECKBOX_CLASS;
+        checkbox.checked = false;
+        checkbox.title = 'Select for bulk export';
+
+        Object.assign(checkbox.style, {
+          marginRight: '8px',
+          cursor: 'pointer',
+          zIndex: '10'
+        });
+
+        // Prevent clicking the checkbox from navigating to the chat
+        checkbox.addEventListener('click', (e) => {
+          e.stopPropagation();
+        });
+
+        // Insert at the beginning of the item
+        item.prepend(checkbox);
+      });
+    }
+
+    /**
+     * Returns all selected sidebar chat entries
+     */
+    getSelectedEntries() {
+      const selected = [];
+      const items = document.querySelectorAll(CONFIG.SELECTORS.SIDEBAR_ITEM);
+      items.forEach(item => {
+        const cb = item.querySelector(`.${CONFIG.SIDEBAR_CHECKBOX_CLASS}`);
+        if (cb && cb.checked) {
+          const title = item.querySelector(CONFIG.SELECTORS.SIDEBAR_ITEM_TEXT)?.textContent?.trim() || 'Untitled Chat';
+          selected.push({ element: item, title });
+        }
+      });
+      return selected;
+    }
+
+    /**
+     * Sets the checked state of all sidebar checkboxes
+     */
+    setAllChecked(checked) {
+      document.querySelectorAll(`.${CONFIG.SIDEBAR_CHECKBOX_CLASS}`).forEach(cb => {
+        cb.checked = checked;
+      });
+    }
+
+    /**
+     * Starts observing the sidebar for changes to re-inject checkboxes
+     */
+    observeSidebar() {
+      if (this.observer) return;
+
+      const sidebar = document.querySelector(CONFIG.SELECTORS.SIDEBAR_CONTAINER);
+      if (!sidebar) return;
+
+      this.observer = new MutationObserver(() => {
+        this.injectCheckboxes();
+      });
+
+      this.observer.observe(sidebar, { childList: true, subtree: true });
+      this.injectCheckboxes();
+      this.injectControls();
+    }
+
+    /**
+     * Injects the bulk export controls into the sidebar
+     */
+    injectControls() {
+      if (document.getElementById(CONFIG.SIDEBAR_CONTROLS_ID)) return;
+
+      const sidebar = document.querySelector(CONFIG.SELECTORS.SIDEBAR_CONTAINER);
+      if (!sidebar) return;
+
+      const controls = UIBuilder.createSidebarControls();
+
+      // Try to find a good place to insert - maybe after the "New Chat" button or at the top
+      sidebar.prepend(controls);
+
+      this.attachControlListeners(controls);
+    }
+
+    /**
+     * Attaches event listeners to the sidebar controls
+     */
+    attachControlListeners(controls) {
+      controls.querySelector('#gemini-select-all').addEventListener('click', () => this.setAllChecked(true));
+      controls.querySelector('#gemini-deselect-all').addEventListener('click', () => this.setAllChecked(false));
+      controls.querySelector('#gemini-bulk-export').addEventListener('click', () => {
+        const event = new CustomEvent('gemini-bulk-export-start', {
+          detail: {
+            format: controls.querySelector('#gemini-bulk-format').value
+          }
+        });
+        document.dispatchEvent(event);
+      });
+    }
+
+    /**
+     * Updates the progress message in the sidebar
+     */
+    updateProgress(message) {
+      const progress = document.getElementById('gemini-bulk-progress');
+      if (progress) {
+        progress.style.display = message ? 'block' : 'none';
+        progress.textContent = message;
+      }
+    }
+  }
+
+  // ============================================================================
   // CHECKBOX MANAGER
   // ============================================================================
   class CheckboxManager {
@@ -634,6 +834,48 @@
       dropdown.innerHTML = this.createDropdownHTML();
       return dropdown;
     }
+
+      /**
+       * Creates the bulk export controls for the sidebar
+       */
+      static createSidebarControls() {
+        const container = document.createElement('div');
+        container.id = CONFIG.SIDEBAR_CONTROLS_ID;
+
+        const isDark = DOMUtils.isDarkMode();
+        const inputStyles = this.getInputStyles(isDark);
+
+        Object.assign(container.style, {
+          padding: '12px',
+          margin: '10px',
+          borderRadius: '8px',
+          background: isDark ? '#2a2a2a' : '#f0f2f5',
+          fontSize: '0.9em',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px'
+        });
+
+        container.innerHTML = `
+          <div style="font-weight:bold;margin-bottom:4px;">Bulk Export</div>
+          <div style="display:flex;gap:8px;">
+            <button id="gemini-select-all" style="flex:1;padding:4px;cursor:pointer;border-radius:4px;border:1px solid #ccc;background:${isDark ? '#444' : '#fff'};color:${isDark ? '#fff' : '#000'}">Select All</button>
+            <button id="gemini-deselect-all" style="flex:1;padding:4px;cursor:pointer;border-radius:4px;border:1px solid #ccc;background:${isDark ? '#444' : '#fff'};color:${isDark ? '#fff' : '#000'}">Deselect All</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <label for="gemini-bulk-format">Format:</label>
+            <select id="gemini-bulk-format" style="flex:1;padding:4px;${inputStyles} border-radius:4px;">
+              <option value="md">Markdown</option>
+              <option value="html">HTML</option>
+              <option value="txt">Plain Text</option>
+            </select>
+          </div>
+          <button id="gemini-bulk-export" style="padding:8px;cursor:pointer;background:${CONFIG.STYLES.BUTTON_PRIMARY};color:#fff;border:none;border-radius:4px;font-weight:bold;">Export Selected Chats</button>
+          <div id="gemini-bulk-progress" style="display:none;font-size:0.85em;color:#888;text-align:center;"></div>
+        `;
+
+        return container;
+      }
   }
 
   function tableToMarkdown(table, service) {
@@ -758,6 +1000,91 @@ ${code}\n\
   }
 
   // ============================================================================
+  // BULK EXPORT SERVICE
+  // ============================================================================
+
+  /**
+   * Orchestrates the bulk export of multiple chats
+   */
+  class BulkExportService {
+    constructor(sidebarManager, exportService) {
+      this.sidebarManager = sidebarManager;
+      this.exportService = exportService;
+      this.isExporting = false;
+    }
+
+    /**
+     * Executes the bulk export process
+     */
+    async execute(format) {
+      if (this.isExporting) return;
+
+      const selectedEntries = this.sidebarManager.getSelectedEntries();
+      if (selectedEntries.length === 0) {
+        alert('Please select at least one chat to export from the sidebar.');
+        return;
+      }
+
+      if (!confirm(`Export ${selectedEntries.length} chats as ${format.toUpperCase()}?`)) {
+        return;
+      }
+
+      this.isExporting = true;
+      try {
+        for (let i = 0; i < selectedEntries.length; i++) {
+          const entry = selectedEntries[i];
+          this.sidebarManager.updateProgress(`Exporting ${i + 1} of ${selectedEntries.length}: ${entry.title}...`);
+
+          // Navigate to the chat
+          entry.element.click();
+
+          // Wait for chat to load (wait for title or messages)
+          await this._waitForChatLoad(entry.title);
+
+          // Use existing logic to export the current chat
+          await this.exportService.executeForBulk(format, entry.title);
+
+          // Short delay between exports
+          await DOMUtils.sleep(1000);
+        }
+
+        DOMUtils.createNotification(`Bulk export of ${selectedEntries.length} chats completed!`);
+      } catch (error) {
+        console.error('Bulk export error:', error);
+        alert(`Bulk export failed: ${error.message}`);
+      } finally {
+        this.isExporting = false;
+        this.sidebarManager.updateProgress('');
+      }
+    }
+
+    /**
+     * Waits for the chat to be loaded after navigation
+     */
+    async _waitForChatLoad(expectedTitle) {
+      let attempts = 0;
+      const maxAttempts = 10;
+
+      while (attempts < maxAttempts) {
+        const currentTitle = FilenameService.getConversationTitle();
+        const messages = document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN);
+
+        // If title matches or we have messages, consider it loaded
+        if (messages.length > 0) {
+          // Give it a bit more time to be sure it's fully rendered
+          await DOMUtils.sleep(1000);
+          return;
+        }
+
+        await DOMUtils.sleep(1000);
+        attempts++;
+      }
+
+      throw new Error(`Timed out waiting for chat "${expectedTitle}" to load.`);
+    }
+  }
+
+  // ============================================================================
   // EXPORT SERVICE
   // ============================================================================
   class ExportService {
@@ -843,6 +1170,55 @@ ${code}\n\
         alert(`Export failed: ${error.message}`);
       }
     }
+
+    /**
+     * Specialized execution for bulk export to avoid re-initializing sidebar checkboxes
+     */
+    async executeForBulk(format, title) {
+      // Load all messages
+      await ScrollService.loadAllMessages();
+
+      // Get all turns
+      const turns = Array.from(document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN));
+
+      // Checkboxes are NOT injected here as they might interfere with sidebar ones
+      // We assume "All" messages for bulk export for now, or we could inject/reuse logic
+
+      let markdown = this._buildMarkdownHeader(title);
+      for (let i = 0; i < turns.length; i++) {
+        const turn = turns[i];
+
+        // User message
+        const userQueryElem = turn.querySelector(CONFIG.SELECTORS.USER_QUERY);
+        if (userQueryElem) {
+          const userQuery = this.markdownConverter.extractUserQuery(userQueryElem);
+          if (userQuery) {
+            markdown += `## 👤 You\n\n${userQuery}\n\n`;
+          }
+        }
+
+        // Model response
+        const modelRespElem = turn.querySelector(CONFIG.SELECTORS.MODEL_RESPONSE);
+        if (modelRespElem) {
+          const modelResponse = this.markdownConverter.extractModelResponse(modelRespElem);
+          if (modelResponse) {
+            markdown += `## 🤖 Gemini\n\n${modelResponse}\n\n`;
+          }
+        }
+        markdown += '---\n\n';
+      }
+
+      const filename = FilenameService.generate('', title);
+
+      let finalContent = markdown;
+      if (format === 'html') {
+        finalContent = HtmlConverter.convert(markdown, title);
+      } else if (format === 'txt') {
+        finalContent = TxtConverter.convert(markdown);
+      }
+
+      FileExportService.download(finalContent, filename, format);
+    }
   }
 
   // ============================================================================
@@ -850,9 +1226,11 @@ ${code}\n\
   // ============================================================================
   class ExportController {
     constructor() {
+      this.sidebarManager = new SidebarManager();
       this.checkboxManager = new CheckboxManager();
       this.selectionManager = new SelectionManager(this.checkboxManager);
       this.exportService = new ExportService(this.checkboxManager);
+      this.bulkExportService = new BulkExportService(this.sidebarManager, this.exportService);
       this.button = null;
       this.dropdown = null;
     }
@@ -861,6 +1239,9 @@ ${code}\n\
       this.createUI();
       this.attachEventListeners();
       this.observeStorageChanges();
+
+      // Initialize sidebar observation
+      this.sidebarManager.observeSidebar();
     }
 
     createUI() {
@@ -914,6 +1295,11 @@ ${code}\n\
             e.target !== this.button) {
           this.dropdown.style.display = 'none';
         }
+      });
+
+      // Bulk export listener
+      document.addEventListener('gemini-bulk-export-start', (e) => {
+        this.bulkExportService.execute(e.detail.format);
       });
     }
 
